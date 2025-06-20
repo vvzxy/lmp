@@ -19,6 +19,7 @@
 #include "net_watcher/include/net_watcher.h"
 #include "net_watcher/include/dropreason.h"
 #include "net/net_watcher/net_watcher.skel.h"
+#include "../include/net_watcher_hepler.h"
 #include <argp.h>
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -35,26 +36,20 @@
 
 static volatile bool exiting = false;
 struct packet_count proto_stats[256] = {0};
-static u64 rst_count = 0;
 static struct reset_event_t event_store[MAX_EVENTS];
-static int event_count = 0, num_symbols = 0, cache_size = 0;
-static char binary_path[64] = "";
-
-typedef struct
-{
-    char key[256];
-    u32 value;
-} kv_pair;
-
-static int map_fd;
-
+int event_count = 0, num_symbols = 0, cache_size = 0, map_fd, count[NUM_LAYERS] = {0};
+static u64 sample_period = TIME_THRESHOLD_NS, rst_count = 0;
+static char binary_path[64] = "", *dst_ip = NULL, *src_ip = NULL;
 static int sport = 0, dport = 0; // for filter
 static int all_conn = 0, err_packet = 0, extra_conn_info = 0, layer_time = 0,
            http_info = 0, retrans_info = 0, udp_info = 0, net_filter = 0,
            drop_reason = 0, addr_to_func = 0, icmp_info = 0, tcp_info = 0,
            time_load = 0, dns_info = 0, stack_info = 0, mysql_info = 0,
            redis_info = 0, count_info = 0, rtt_info = 0, rst_info = 0,
-           protocol_count = 0, redis_stat = 0; // flag
+           protocol_count = 0, redis_stat = 0, overrun_time = 0; // flag
+struct SymbolEntry symbols[300000];
+struct SymbolEntry cache[CACHEMAXSIZE];
+float ewma_values[NUM_LAYERS] = {0};
 
 static const char argp_program_doc[] = "Watch tcp/ip in network subsystem \n";
 static const struct argp_option opts[] = {
@@ -66,14 +61,16 @@ static const struct argp_option opts[] = {
     {"http", 'i', 0, 0, "set to trace http info"},
     {"sport", 's', "SPORT", 0, "trace this source port only"},
     {"dport", 'd', "DPORT", 0, "trace this destination port only"},
+    {"src-ip", 'S', "SRC_IP", 0, "Filter by source IP address"},
+    {"dst-ip", 'D', "DST_IP", 0, "Filter by destination IP address"},
     {"udp", 'u', 0, 0, "trace the udp message"},
     {"net_filter", 'n', 0, 0, "trace ipv4 packget filter "},
     {"drop_reason", 'k', 0, 0, "trace kfree "},
     {"addr_to_func", 'F', 0, 0, "translation addr to func and offset"},
     {"icmptime", 'I', 0, 0, "set to trace layer time of icmp"},
-    {"tcpstate", 'S', 0, 0, "set to trace tcpstate"},
+    {"tcpstate", 'P', 0, 0, "set to trace tcpstate"},
     {"timeload", 'L', 0, 0, "analysis time load"},
-    {"dns", 'D', 0, 0,
+    {"dns", 'N', 0, 0,
      "set to trace dns information info include Id 事务ID、Flags 标志字段、Qd "
      "问题部分计数、An 应答记录计数、Ns 授权记录计数、Ar 附加记录计数、Qr "
      "域名、rx 收发包 、Qc请求数、Sc响应数"},
@@ -88,6 +85,8 @@ static const struct argp_option opts[] = {
     {"rtt", 'T', 0, 0, "set to trace rtt"},
     {"rst_counters", 'U', 0, 0, "set to trace rst"},
     {"protocol_count", 'p', 0, 0, "set to trace protocol count"},
+    {"overrun_time", 'o', "PERIOD", 0, "set to trace rto overrun"},
+    {NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help"},
     {}};
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
@@ -119,6 +118,12 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
     case 'd':
         dport = strtoul(arg, &end, 10);
         break;
+    case 'S':
+        src_ip = arg;
+        break;
+    case 'D':
+        dst_ip = arg;
+        break;
     case 'u':
         udp_info = 1;
         break;
@@ -134,13 +139,13 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
     case 'I':
         icmp_info = 1;
         break;
-    case 'S':
+    case 'P':
         tcp_info = 1;
         break;
     case 'L':
         time_load = 1;
         break;
-    case 'D':
+    case 'N':
         dns_info = 1;
         break;
     case 'A':
@@ -167,11 +172,18 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
     case 'C':
         count_info = strtoul(arg, &end, 10);
         break;
+    case 'o':
+        overrun_time = strtoul(arg, &end, 10);
+        break;
+    case 'h':
+        argp_state_help(state, stderr, ARGP_HELP_STD_HELP);
+        break;
     default:
         return ARGP_ERR_UNKNOWN;
     }
     return 0;
 }
+
 static const struct argp argp = {
     .options = opts,
     .parser = parse_arg,
@@ -195,6 +207,7 @@ enum MonitorMode
     MODE_RETRANS,
     MODE_CONN,
     MODE_ERROR,
+    MODE_OVERTIME,
     MODE_DEFAULT
 };
 enum MonitorMode get_monitor_mode()
@@ -263,237 +276,14 @@ enum MonitorMode get_monitor_mode()
     {
         return MODE_ERROR;
     }
+    else if (overrun_time)
+    {
+        return MODE_OVERTIME;
+    }
     else
     {
         return MODE_DEFAULT;
     }
-}
-#define LOGO_STRING                                                            \
-    " "                                                                        \
-    "              __                          __           __               " \
-    "        \n"                                                               \
-    "             /\\ \\__                      /\\ \\__       /\\ \\        " \
-    "              \n"                                                         \
-    "  ___      __\\ \\  _\\  __  __  __     __  \\ \\  _\\   ___\\ \\ \\___ " \
-    "     __   _ __   \n"                                                      \
-    "/  _  \\  / __ \\ \\ \\/ /\\ \\/\\ \\/\\ \\  / __ \\ \\ \\ \\/  / ___\\ " \
-    "\\  _  \\  / __ \\/\\  __\\ \n"                                           \
-    "/\\ \\/\\ \\/\\  __/\\ \\ \\_\\ \\ \\_/ \\_/ \\/\\ \\_\\ \\_\\ \\ "       \
-    "\\_/\\ \\__/\\ \\ \\ \\ \\/\\  __/\\ \\ \\/  \n"                          \
-    "\\ \\_\\ \\_\\ \\____\\ \\__\\ \\_______ / /\\ \\__/\\ \\_\\ \\__\\ "     \
-    "\\____/\\ \\_\\ \\_\\ \\____ \\ \\_\\  \n"                                \
-    " \\/_/\\/_/\\/____/ \\/__/ \\/__//__ /  \\/_/  \\/_/\\/__/\\/____/ "      \
-    "\\/_/\\/_/\\/____/ \\/_/  \n\n"
-
-void print_logo()
-{
-    char *logo = LOGO_STRING;
-    int i = 0;
-    FILE *lolcat_pipe = popen("/usr/games/lolcat", "w");
-    if (lolcat_pipe == NULL)
-    {
-        printf("Error: Unable to execute lolcat command.\n");
-        return;
-    }
-    // 像lolcat管道逐个字符写入字符串
-    while (logo[i] != '\0')
-    {
-        fputc(logo[i], lolcat_pipe);
-        fflush(lolcat_pipe); // 刷新管道，确保字符被立即发送给lolcat
-        usleep(150);
-        i++;
-    }
-
-    pclose(lolcat_pipe);
-}
-#define __ATTACH_UPROBE(skel, sym_name, prog_name, is_retprobe)           \
-    do                                                                    \
-    {                                                                     \
-        LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .func_name = #sym_name, \
-                    .retprobe = is_retprobe);                             \
-        skel->links.prog_name = bpf_program__attach_uprobe_opts(          \
-            skel->progs.prog_name, -1, binary_path, 0, &uprobe_opts);     \
-    } while (false)
-
-#define __CHECK_PROGRAM(skel, prog_name)                   \
-    do                                                     \
-    {                                                      \
-        if (!skel->links.prog_name)                        \
-        {                                                  \
-            perror("no program attached for " #prog_name); \
-            return -errno;                                 \
-        }                                                  \
-    } while (false)
-
-#define __ATTACH_UPROBE_CHECKED(skel, sym_name, prog_name, is_retprobe) \
-    do                                                                  \
-    {                                                                   \
-        __ATTACH_UPROBE(skel, sym_name, prog_name, is_retprobe);        \
-        __CHECK_PROGRAM(skel, prog_name);                               \
-    } while (false)
-
-#define ATTACH_UPROBE(skel, sym_name, prog_name) \
-    __ATTACH_UPROBE(skel, sym_name, prog_name, false)
-#define ATTACH_URETPROBE(skel, sym_name, prog_name) \
-    __ATTACH_UPROBE(skel, sym_name, prog_name, true)
-
-#define ATTACH_UPROBE_CHECKED(skel, sym_name, prog_name) \
-    __ATTACH_UPROBE_CHECKED(skel, sym_name, prog_name, false)
-#define ATTACH_URETPROBE_CHECKED(skel, sym_name, prog_name) \
-    __ATTACH_UPROBE_CHECKED(skel, sym_name, prog_name, true)
-
-struct SymbolEntry symbols[300000];
-struct SymbolEntry cache[CACHEMAXSIZE];
-// LRU算法查找函数
-struct SymbolEntry find_in_cache(unsigned long int addr)
-{
-    // 查找地址是否在快表中
-    for (int i = 0; i < cache_size; i++)
-    {
-        if (cache[i].addr == addr)
-        {
-            // 更新访问时间
-            struct SymbolEntry temp = cache[i];
-            // 将访问的元素移动到快表的最前面，即最近使用的位置
-            for (int j = i; j > 0; j--)
-            {
-                cache[j] = cache[j - 1];
-            }
-            cache[0] = temp;
-            return temp;
-        }
-    }
-    // 如果地址不在快表中，则返回空
-    struct SymbolEntry empty_entry;
-    empty_entry.addr = 0;
-    return empty_entry;
-}
-// 将新的符号条目加入快表
-void add_to_cache(struct SymbolEntry entry)
-{
-    // 如果快表已满，则移除最久未使用的条目
-    if (cache_size == CACHEMAXSIZE)
-    {
-        for (int i = cache_size - 1; i > 0; i--)
-        {
-            cache[i] = cache[i - 1];
-        }
-        cache[0] = entry;
-    }
-    else
-    {
-        // 否则，直接加入快表
-        for (int i = cache_size; i > 0; i--)
-        {
-            cache[i] = cache[i - 1];
-        }
-        cache[0] = entry;
-        cache_size++;
-    }
-}
-struct SymbolEntry findfunc(unsigned long int addr)
-{
-    // 先在快表中查找
-    struct SymbolEntry entry = find_in_cache(addr);
-    if (entry.addr != 0)
-    {
-        return entry;
-    }
-    unsigned long long low = 0, high = num_symbols - 1;
-    unsigned long long result = -1;
-
-    while (low <= high)
-    {
-        int mid = low + (high - low) / 2;
-        if (symbols[mid].addr < addr)
-        {
-            result = mid;
-            low = mid + 1;
-        }
-        else
-        {
-            high = mid - 1;
-        }
-    }
-    add_to_cache(symbols[result]);
-    return symbols[result];
-};
-
-void readallsym()
-{
-    FILE *file = fopen("/proc/kallsyms", "r");
-    if (!file)
-    {
-        perror("Error opening file");
-        exit(EXIT_FAILURE);
-    }
-    char line[256];
-    while (fgets(line, sizeof(line), file))
-    {
-        unsigned long addr;
-        char type, name[30];
-        int ret = sscanf(line, "%lx %c %s", &addr, &type, name);
-        if (ret == 3)
-        {
-            symbols[num_symbols].addr = addr;
-            strncpy(symbols[num_symbols].name, name, 30);
-            num_symbols++;
-        }
-    }
-
-    fclose(file);
-}
-/*
-    指数加权移动平均算法（EWMA）
-    1.使用指数加权移动平均算法（EWMA）来计算每层的指数加权移动平均值，
-    公式EWMA_new = alpha * new_value + (1 - alpha) * old_ewma ,alpha
-   指数加权系数，表示新数据点的权重，new_value 当前时延，old_ewma
-   旧的指数加权移动平均值
-    2.根据当前时延和指数加权移动平均值*预先设定的粒度阈值（GRANULARITY）对比，来判断时延是否异常
-    3.可以快速适应数据的变化，并能够有效地检测异常时延
-
-*/
-// 全局变量用于存储每层的移动平均值
-float ewma_values[NUM_LAYERS] = {0};
-int count[NUM_LAYERS] = {0};
-
-// 指数加权移动平均算法
-float calculate_ewma(float new_value, float old_ewma)
-{
-    return ALPHA * new_value + (1 - ALPHA) * old_ewma;
-}
-
-// 收集时延数据并检测异常
-int process_delay(float layer_delay, int layer_index)
-{
-
-    if (layer_delay == 0)
-        return 0;
-    count[layer_index]++;
-    if (ewma_values[layer_index] == 0)
-    {
-        ewma_values[layer_index] = layer_delay;
-        return 0;
-    }
-    // 计算阈值,指数加权移动平均值乘以粒度因子
-    ewma_values[layer_index] =
-        calculate_ewma(layer_delay, ewma_values[layer_index]);
-    float threshold = ewma_values[layer_index] * GRANULARITY;
-    if (count[layer_index] > 30)
-    {
-        // 判断当前时延是否超过阈值
-        //   printf("%d %d:%f %f
-        //   ",layer_index,count[layer_index]++,threshold,layer_delay);
-        if (layer_delay > threshold)
-        { // 异常
-            return 1;
-        }
-        else
-        {
-            return 0;
-        }
-    }
-    return 0;
 }
 static void set_rodata_flags(struct net_watcher_bpf *skel)
 {
@@ -518,6 +308,7 @@ static void set_rodata_flags(struct net_watcher_bpf *skel)
     skel->rodata->rtt_info = rtt_info;
     skel->rodata->rst_info = rst_info;
     skel->rodata->protocol_count = protocol_count;
+    skel->rodata->overrun_time = overrun_time;
 }
 static void set_disable_load(struct net_watcher_bpf *skel)
 {
@@ -693,6 +484,8 @@ static void set_disable_load(struct net_watcher_bpf *skel)
                               rst_info ? true : false);
     bpf_program__set_autoload(skel->progs.handle_receive_reset,
                               rst_info ? true : false);
+    bpf_program__set_autoload(skel->progs.handle_tcp_rcv_space_adjust,
+                              overrun_time ? true : false);
 }
 static void print_header(enum MonitorMode mode)
 {
@@ -703,8 +496,8 @@ static void print_header(enum MonitorMode mode)
                "UDP "
                "INFORMATION===================================================="
                "====\n");
-        printf("%-20s %-20s %-20s %-20s %-20s %-20s %-20s\n", "Saddr", "Daddr",
-               "Sprot", "Dprot", "udp_time/μs", "RX/direction", "len/byte");
+        printf("%-20s %-20s %-20s %-20s %-20s %-20s %-20s\n", "Saddr", "Sport",
+               "Daddr", "Dprot", "udp_time/μs", "RX/direction", "len/byte");
         break;
     case MODE_NET_FILTER:
         printf("==============================================================="
@@ -712,7 +505,7 @@ static void print_header(enum MonitorMode mode)
                "INFORMATION===================================================="
                "=======\n");
         printf("%-20s %-20s %-12s %-12s %-8s %-8s %-7s %-8s %-8s %-8s\n",
-               "Saddr", "Daddr", "Sprot", "Dprot", "PreRT/μs", "L_IN/μs",
+               "Saddr", "Sport", "Daddr", "Dprot", "PreRT/μs", "L_IN/μs",
                "FW/μs", "PostRT/μs", "L_OUT/μs", "RX/direction");
         break;
     case MODE_DROP_REASON:
@@ -721,7 +514,7 @@ static void print_header(enum MonitorMode mode)
                "INFORMATION===================================================="
                "====\n");
         printf("%-13s %-17s %-17s %-10s %-10s %-9s %-33s %-30s\n", "Time",
-               "Saddr", "Daddr", "Sprot", "Dprot", "prot", "addr", "reason");
+               "Saddr", "Sport", "Daddr", "Dprot", "prot", "addr", "reason");
         break;
     case MODE_ICMP:
         printf("=================================================ICMP "
@@ -734,8 +527,8 @@ static void print_header(enum MonitorMode mode)
                "TCP STATE "
                "INFORMATION===================================================="
                "====\n");
-        printf("%-20s %-20s %-20s %-20s %-20s %-20s %-20s \n", "Saddr", "Daddr",
-               "Sport", "Dport", "oldstate", "newstate", "time/μs");
+        printf("%-20s %-20s %-20s %-20s %-20s %-20s %-20s \n", "Saddr", "Sport",
+               "Daddr", "Dport", "oldstate", "newstate", "time/μs");
         break;
     case MODE_DNS:
         printf("==============================================================="
@@ -782,28 +575,28 @@ static void print_header(enum MonitorMode mode)
                "INFORMATION===================================================="
                "============================\n");
         printf("%-10s %-20s %-10s %-10s %-10s %-10s %-20s \n", "Pid", "Comm",
-               "Saddr", "Daddr", "Sport", "Dport", "Time");
+               "Saddr", "Sport", "Daddr", "Dport", "Time");
         break;
     case MODE_EXTRA_CONN:
         printf("==============================================================="
                "====================EXTRA CONN "
                "INFORMATION===================================================="
                "============================\n");
-        printf("%-15s %-15s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-13s %-10s %-10s %-10s %-10s\n", "Saddr", "Daddr", "Sport", "Dport", "backlog", "maxbacklog", "rwnd", "cwnd", "ssthresh", "sndbuf", "wmem_queued", "rx_bytes", "tx_bytes", "srtt", "duration");
+        printf("%-15s %-15s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-13s %-10s %-10s %-10s %-10s\n", "Saddr", "Sport", "Daddr", "Dport", "backlog", "maxbacklog", "rwnd", "cwnd", "ssthresh", "sndbuf", "wmem_queued", "rx_bytes", "tx_bytes", "srtt", "duration");
         break;
     case MODE_RETRANS:
         printf("==============================================================="
                "====================RETRANS "
                "INFORMATION===================================================="
                "============================\n");
-        printf("%-15s %-15s %-10s %-10s %-10s %-10s %-10s\n", "Saddr", "Daddr", "Sport", "Dport", "fastRe", "total_retrans", "timeout");
+        printf("%-15s %-15s %-10s %-10s %-10s %-10s %-10s\n", "Saddr", "Sport", "Daddr", "Dport", "fastRe", "total_retrans", "timeout");
         break;
     case MODE_CONN:
         printf("==============================================================="
                "====================CONN "
                "INFORMATION===================================================="
                "============================\n");
-        printf("%-15s %-20s %-15s %-15s %-10s %-10s %-10s\n", "Pid", "Sock", "Saddr", "Daddr", "Sport", "Dport", "Is_Server");
+        printf("%-15s %-20s %-15s %-15s %-10s %-10s %-10s\n", "Pid", "Sock", "Saddr", "Sport", "Daddr", "Dport", "Is_Server");
         break;
     case MODE_DEFAULT:
         printf("==============================================================="
@@ -820,6 +613,13 @@ static void print_header(enum MonitorMode mode)
         printf("%-22s %-20s %-8s %-20s %-8s %-14s %-14s %-15s \n",
                "SOCK", "Saddr", "Sport", "Daddr", "Dport", "Seq", "Ack", "Reason");
         break;
+    case MODE_OVERTIME:
+        printf("==============================================================="
+               "=OVERTIME INFORMATION==================================================="
+               "======================\n");
+        printf("%-20s %-20s %-20s %-20s %-20s %-20s\n",
+               "Saddr", "Sport", "Daddr", "Dport", "RTO", "Delack_max");
+        break;
     case MODE_PROTOCOL_COUNT:
         printf("==============================================================="
                "=MODE_PROTOCOL_COUNT==========================================="
@@ -830,25 +630,7 @@ static void print_header(enum MonitorMode mode)
 }
 
 static void sig_handler(int signo) { exiting = true; }
-static void bytes_to_str(char *str, unsigned long long num)
-{
-    if (num > 1e9)
-    {
-        sprintf(str, "%.8lfG", (double)num / 1e9);
-    }
-    else if (num > 1e6)
-    {
-        sprintf(str, "%.6lfM", (double)num / 1e6);
-    }
-    else if (num > 1e3)
-    {
-        sprintf(str, "%.3lfK", (double)num / 1e3);
-    }
-    else
-    {
-        sprintf(str, "%llu", num);
-    }
-}
+
 static int print_conns(struct net_watcher_bpf *skel)
 {
 
@@ -874,9 +656,7 @@ static int print_conns(struct net_watcher_bpf *skel)
 
         char s_ip_port_str[INET6_ADDRSTRLEN + 6];
         char d_ip_port_str[INET6_ADDRSTRLEN + 6];
-        if ((d.saddr & 0x0000FFFF) == 0x0000007F ||
-            (d.daddr & 0x0000FFFF) == 0x0000007F)
-            return 0;
+
         if (d.family == AF_INET)
         {
             inet_ntop(AF_INET, &d.saddr, s_str, sizeof(s_str));
@@ -903,19 +683,19 @@ static int print_conns(struct net_watcher_bpf *skel)
 
         if (extra_conn_info)
         {
-            printf("%-15s %-15s %-10d %-10d %-10u %-10u %-10u %-10u %-10u %-10u %-13u %-10s %-10s %-10u %-10llu\n",
-                   s_ip_only, d_ip_only, d.sport, d.dport, d.tcp_backlog,
+            printf("%-15s %-10d %-15s %-10d %-10u %-10u %-10u %-10u %-10u %-10u %-13u %-10s %-10s %-10u %-10llu\n",
+                   s_ip_only, d.sport, d_ip_only, d.dport, d.tcp_backlog,
                    d.max_tcp_backlog, d.rcv_wnd, d.snd_cwnd, d.snd_ssthresh,
                    d.sndbuf, d.sk_wmem_queued, received_bytes, acked_bytes, d.srtt,
                    d.duration);
         }
         if (retrans_info)
         {
-            printf("%-15s %-15s %-10d %-10d %-10u %-14u %-10u\n", s_ip_only, d_ip_only, d.sport, d.dport, d.fastRe, d.total_retrans, d.timeout);
+            printf("%-15s %-10d %-15s %-10d %-10u %-14u %-10u\n", s_ip_only, d.sport, d_ip_only, d.dport, d.fastRe, d.total_retrans, d.timeout);
         }
         if (all_conn)
         {
-            printf("%-15d %-20p %-15s %-15s %-10d %-10d %-10u\n", d.pid, d.sock, s_ip_only, d_ip_only, d.sport, d.dport, d.is_server);
+            printf("%-15d %-20p %-15s %-10d %-15s %-10d %-10u\n", d.pid, d.sock, s_ip_only, d.sport, d_ip_only, d.dport, d.is_server);
         }
     }
     return 0;
@@ -923,7 +703,7 @@ static int print_conns(struct net_watcher_bpf *skel)
 static int print_packet(void *ctx, void *packet_info, size_t size)
 {
     if (udp_info || net_filter || drop_reason || icmp_info || tcp_info || all_conn ||
-        dns_info || mysql_info || redis_info || rtt_info || protocol_count || redis_stat || extra_conn_info || retrans_info)
+        dns_info || mysql_info || redis_info || rtt_info || protocol_count || redis_stat || extra_conn_info || retrans_info || overrun_time)
         return 0;
     char http_data[256];
     const struct pack_t *pack_info = packet_info;
@@ -936,15 +716,12 @@ static int print_packet(void *ctx, void *packet_info, size_t size)
     char s_str[INET_ADDRSTRLEN];
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
-    if ((daddr & 0x0000FFFF) == 0x0000007F ||
-        (saddr & 0x0000FFFF) == 0x0000007F)
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+    if (!should_filter_t(s_str, d_str, pack_info->sport, pack_info->dport, src_ip, dst_ip, sport, dport))
+    {
         return 0;
-    if (dport)
-        if (pack_info->dport != dport)
-            return 0;
-    if (sport)
-        if (pack_info->sport != sport)
-            return 0;
+    }
     if (strstr((char *)pack_info->data, "HTTP/1"))
     {
 
@@ -964,12 +741,13 @@ static int print_packet(void *ctx, void *packet_info, size_t size)
     }
     if (layer_time)
     {
+
         printf("%-22p %-20s %-8d %-20s %-8d %-14llu %-14llu %-14llu %-14u %-14u %-14d "
                "%-16s",
                pack_info->sock,
-               inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
+               s_str,
                pack_info->sport,
-               inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)),
+               d_str,
                pack_info->dport, pack_info->mac_time, pack_info->ip_time,
                pack_info->tran_time, pack_info->seq, pack_info->ack, pack_info->rx, http_data);
     }
@@ -996,9 +774,9 @@ static int print_packet(void *ctx, void *packet_info, size_t size)
             }
             printf("%-22p %-20s %-8d %-20s %-8d %-14u %-14u %-14s ",
                    pack_info->sock,
-                   inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
+                   s_str,
                    pack_info->sport,
-                   inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)),
+                   d_str,
                    pack_info->dport, pack_info->seq, pack_info->ack, reason);
         }
     }
@@ -1006,9 +784,9 @@ static int print_packet(void *ctx, void *packet_info, size_t size)
     {
         printf("%-22p %-20s %-8d %-20s %-8d %-14u %-14u %-14u %-14u %-14u %-14d %-16s\n",
                pack_info->sock,
-               inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
+               s_str,
                pack_info->sport,
-               inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)),
+               d_str,
                pack_info->dport, 0, 0, 0, pack_info->seq, pack_info->ack, pack_info->rx, http_data);
     }
     if (time_load)
@@ -1028,20 +806,22 @@ static int print_udp(void *ctx, void *packet_info, size_t size)
 {
     if (!udp_info)
         return 0;
+
     char d_str[INET_ADDRSTRLEN];
     char s_str[INET_ADDRSTRLEN];
     const struct udp_message *pack_info = packet_info;
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
 
-    if (pack_info->tran_time > MAXTIME || (daddr & 0x0000FFFF) == 0x0000007F ||
-        (saddr & 0x0000FFFF) == 0x0000007F)
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+    if (!should_filter_t(s_str, d_str, pack_info->sport, pack_info->dport, src_ip, dst_ip, sport, dport))
+    {
         return 0;
-    printf("%-20s %-20s %-20u %-20u %-20llu %-20d %-20d",
-           inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
-           inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)), pack_info->sport,
-           pack_info->dport, pack_info->tran_time, pack_info->rx,
-           pack_info->len);
+    }
+    printf("%-20s %-20u %-20s %-20u %-20llu %-20d %-20d\n",
+           s_str, pack_info->sport, d_str, pack_info->dport,
+           pack_info->tran_time, pack_info->rx, pack_info->len);
 
     if (time_load)
     {
@@ -1049,9 +829,9 @@ static int print_udp(void *ctx, void *packet_info, size_t size)
         if (flag)
             printf("%-15s", "abnormal data");
     }
-    printf("\n");
     return 0;
 }
+
 static int print_netfilter(void *ctx, void *packet_info, size_t size)
 {
     if (!net_filter)
@@ -1059,20 +839,27 @@ static int print_netfilter(void *ctx, void *packet_info, size_t size)
     char d_str[INET_ADDRSTRLEN];
     char s_str[INET_ADDRSTRLEN];
     const struct netfilter *pack_info = packet_info;
+
     if (pack_info->local_input_time > MAXTIME ||
         pack_info->forward_time > MAXTIME ||
         pack_info->local_out_time > MAXTIME ||
         pack_info->post_routing_time > MAXTIME ||
         pack_info->pre_routing_time > MAXTIME)
         return 0;
+
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
-    // if ((daddr & 0x0000FFFF) == 0x0000007F ||
-    //     (saddr & 0x0000FFFF) == 0x0000007F)
-    //     return 0;
-    printf("%-20s %-20s %-12d %-12d %-8lld %-8lld% -8lld %-8lld %-8lld %-8d",
-           inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
-           inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)), pack_info->sport,
+
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+
+    if (!should_filter_t(s_str, d_str, pack_info->sport, pack_info->dport, src_ip, dst_ip, sport, dport))
+    {
+        return 0;
+    }
+
+    printf("%-20s %-12d %-20s %-12d %-8lld %-8lld% -8lld %-8lld %-8lld %-8d",
+           s_str, pack_info->sport, d_str,
            pack_info->dport, pack_info->pre_routing_time,
            pack_info->local_input_time, pack_info->forward_time,
            pack_info->post_routing_time, pack_info->local_out_time,
@@ -1110,9 +897,15 @@ static int print_tcpstate(void *ctx, void *packet_info, size_t size)
     const struct tcp_state *pack_info = packet_info;
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
-    printf("%-20s %-20s %-20d %-20d %-20s %-20s  %-20lld\n",
-           inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
-           inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)), pack_info->sport,
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+    if (!should_filter_t(s_str, d_str, pack_info->sport, pack_info->dport, src_ip, dst_ip, sport, dport))
+    {
+        return 0;
+    }
+
+    printf("%-20s %-20d %-20s %-20d %-20s %-20s  %-20lld\n",
+           s_str, pack_info->sport, d_str,
            pack_info->dport, tcp_states[pack_info->oldstate],
            tcp_states[pack_info->newstate], pack_info->time);
 
@@ -1221,14 +1014,16 @@ static int print_kfree(void *ctx, void *packet_info, size_t size)
         return 0;
     char d_str[INET_ADDRSTRLEN];
     char s_str[INET_ADDRSTRLEN];
+    char prot[6];
     const struct reasonissue *pack_info = packet_info;
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
-    if (saddr == 0 && daddr == 0)
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+    if (!should_filter_t(s_str, d_str, pack_info->sport, pack_info->dport, src_ip, dst_ip, sport, dport))
     {
         return 0;
     }
-    char prot[6];
     if (pack_info->protocol == 2048)
     {
         strcpy(prot, "ipv4");
@@ -1244,10 +1039,9 @@ static int print_kfree(void *ctx, void *packet_info, size_t size)
     }
     time_t now = time(NULL);
     struct tm *localTime = localtime(&now);
-    printf("%02d:%02d:%02d      %-17s %-17s %-10u %-10u %-10s",
+    printf("%02d:%02d:%02d      %-17s %-10u %-17s %-10u %-10s",
            localTime->tm_hour, localTime->tm_min, localTime->tm_sec,
-           inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
-           inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)), pack_info->sport,
+           s_str, pack_info->sport, d_str,
            pack_info->dport, prot);
     if (!addr_to_func)
         printf("%-34lx", pack_info->location);
@@ -1274,9 +1068,14 @@ static int print_icmptime(void *ctx, void *packet_info, size_t size)
     }
     unsigned int saddr = pack_info->saddr;
     unsigned int daddr = pack_info->daddr;
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+    if (!should_filter(s_str, d_str, src_ip, dst_ip))
+    {
+        return 0;
+    }
     printf("%-20s %-20s %-20lld %-20d",
-           inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str)),
-           inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str)),
+           s_str, d_str,
            pack_info->icmp_tran_time, pack_info->flag);
     if (time_load)
     {
@@ -1313,7 +1112,7 @@ static void print_stored_events()
     char d_str[INET_ADDRSTRLEN];
     char saddr_v6[INET6_ADDRSTRLEN];
     char daddr_v6[INET6_ADDRSTRLEN];
-    
+
     for (int i = 0; i < event_count; i++)
     {
         struct reset_event_t *event = &event_store[i];
@@ -1324,9 +1123,9 @@ static void print_stored_events()
         {
             inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
             inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
-            printf("%-10d %-10s %-10s %-10s %-10u %-10u %-20llu",
-                   event->pid, event->comm, s_str, d_str,
-                   event->sport, event->dport,
+            printf("%-10d %-10s %-10s %-10u %-10s %-10u %-20llu",
+                   event->pid, event->comm, s_str,
+                   event->sport, d_str, event->dport,
                    event->timestamp);
         }
         else if (event->family == AF_INET6)
@@ -1334,37 +1133,13 @@ static void print_stored_events()
 
             inet_ntop(AF_INET6, &event->saddr_v6, saddr_v6, sizeof(saddr_v6));
             inet_ntop(AF_INET6, &event->daddr_v6, daddr_v6, sizeof(daddr_v6));
-            printf("%-10d %10s %-10s %-10s %-10u %-10u %-20llu\n",
+            printf("%-10d %10s %-10s %-10u %-10s %-10u %-20llu\n",
                    event->pid, event->comm, saddr_v6,
-                   daddr_v6, event->sport, event->dport,
+                   event->sport, daddr_v6, event->dport,
                    event->timestamp);
         }
         printf("\n");
     }
-}
-static void print_domain_name(const unsigned char *data, char *output)
-{
-    const unsigned char *next = data;
-    int pos = 0, first = 1;
-    // 循环到尾部，标志0
-    while (*next != 0)
-    {
-        if (!first)
-        {
-            output[pos++] = '.'; // 在每个段之前添加点号
-        }
-        else
-        {
-            first = 0; // 第一个段后清除标志
-        }
-        int len = *next++; // 下一个段长度
-
-        for (int i = 0; i < len; ++i)
-        {
-            output[pos++] = *next++;
-        }
-    }
-    output[pos] = '\0'; 
 }
 static int print_dns(void *ctx, void *packet_info, size_t size)
 {
@@ -1380,12 +1155,13 @@ static int print_dns(void *ctx, void *packet_info, size_t size)
 
     inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
     inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
-
     print_domain_name((const unsigned char *)pack_info->data, domain_name);
-    if (pack_info->daddr == 0)
+
+    if (!should_filter(s_str, d_str, src_ip, dst_ip))
     {
         return 0;
     }
+
     printf("%-20s %-20s %-#12x %-#12x %-5x %-5x %-5x %-5x %-47s %-10d %-10d "
            "%-10d \n",
            s_str, d_str, pack_info->id, pack_info->flags, pack_info->qdcount,
@@ -1430,35 +1206,6 @@ static int print_redis(void *ctx, void *packet_info, size_t size)
     strcpy(redis, "");
     return 0;
 }
-static int process_redis_first(char flag, char *message)
-{
-    if (flag == '+')
-    {
-        strcpy(message, "Status Reply");
-    }
-    else if (flag == '-')
-    {
-        strcpy(message, "Error Reply");
-    }
-    else if (flag == ':')
-    {
-        strcpy(message, "Integer Reply");
-    }
-    else if (flag == '$')
-    {
-        strcpy(message, "Bulk String Reply");
-    }
-    else if (flag == '*')
-    {
-        strcpy(message, "Array Reply");
-    }
-    else
-    {
-        strcpy(message, "Unknown Type");
-    }
-    return 0;
-}
-
 static int print_redis_stat(void *ctx, void *packet_info, size_t size)
 {
     if (!redis_stat)
@@ -1529,6 +1276,32 @@ static int print_trace(void *_ctx, void *data, size_t size)
     printf("\n");
     return 0;
 }
+
+static int print_rate(void *ctx, void *data, size_t size)
+{
+    if (!overrun_time)
+    {
+        return 0;
+    }
+    char d_str[INET_ADDRSTRLEN];
+    char s_str[INET_ADDRSTRLEN];
+    const struct tcp_rate *pack_info = (const struct tcp_rate *)data;
+    unsigned int saddr = pack_info->skbap.saddr;
+    unsigned int daddr = pack_info->skbap.daddr;
+    inet_ntop(AF_INET, &saddr, s_str, sizeof(s_str));
+    inet_ntop(AF_INET, &daddr, d_str, sizeof(d_str));
+
+    if (!should_filter_t(s_str, d_str, pack_info->skbap.sport, pack_info->skbap.dport, src_ip, dst_ip, sport, dport))
+    {
+        return 0;
+    }
+
+    printf("%-20s %-20d %-20s %-20d %-20lld %-20lld\n", s_str,
+           pack_info->skbap.sport, d_str, pack_info->skbap.dport, pack_info->tcp_rto,
+           pack_info->tcp_delack_max);
+
+    return 0;
+}
 static int print_rtt(void *ctx, void *data, size_t size)
 {
     if (!rtt_info)
@@ -1540,12 +1313,9 @@ static int print_rtt(void *ctx, void *data, size_t size)
     char s_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &rtt_tuple->saddr, s_str, sizeof(s_str));
     inet_ntop(AF_INET, &rtt_tuple->daddr, d_str, sizeof(d_str));
-    if ((rtt_tuple->saddr & 0x0000FFFF) == 0x0000007F ||
-        (rtt_tuple->daddr & 0x0000FFFF) == 0x0000007F ||
-        rtt_tuple->saddr == htonl(0xC0A83C01) ||
-        rtt_tuple->daddr == htonl(0xC0A83C01))
+    if (!should_filter(s_str, d_str, src_ip, dst_ip))
     {
-        return 0; // 如果匹配任一过滤条件，放弃处理这些数据包
+        return 0;
     }
     // 打印源地址和目的地址
     printf("Source Address: %s\n", s_str);
@@ -1636,10 +1406,8 @@ void print_top_5_keys()
         // printf("Key: %s, Count: %u\n", pairs[index].key, pairs[index].value);
         index++;
     }
-    // 获取所有键值对
 
-    // 排序前 5 个元素
-    // 简单选择排序（可替换为其他高效排序算法）
+    // 简单选择排序前 5 个元素
     for (int i = 0; i < index - 1; i++)
     {
         for (int j = i + 1; j < index; j++)
@@ -1653,7 +1421,7 @@ void print_top_5_keys()
         }
     }
     printf("----------------------------\n");
-    
+
     printf("Top 5 Keys:\n");
     for (int i = 0; i < 5 && i < index; i++)
     {
@@ -1662,6 +1430,7 @@ void print_top_5_keys()
     free(pairs);
 }
 
+// free
 int main(int argc, char **argv)
 {
 
@@ -1679,6 +1448,7 @@ int main(int argc, char **argv)
     struct ring_buffer *rtt_rb = NULL;
     struct ring_buffer *events = NULL;
     struct ring_buffer *port_rb = NULL;
+    struct ring_buffer *rate_rb = NULL;
     struct net_watcher_bpf *skel;
     int err;
     /* Parse command line arguments */
@@ -1688,8 +1458,8 @@ int main(int argc, char **argv)
         if (err)
             return err;
     }
-    
-   // libbpf_set_print(libbpf_print_fn);
+
+    // libbpf_set_print(libbpf_print_fn);
 
     /* Cleaner handling of Ctrl-C */
     signal(SIGINT, sig_handler);
@@ -1856,6 +1626,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Failed to create ring buffer(trace)\n");
         goto cleanup;
     }
+
+    rate_rb = ring_buffer__new(bpf_map__fd(skel->maps.rate_rb),
+                               print_rate, NULL, NULL);
+    if (!rate_rb)
+    {
+        err = -1;
+        fprintf(stderr, "Failed to create ring buffer(trace)\n");
+        goto cleanup;
+    }
     /* Set up ring buffer polling */
     rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), print_packet, NULL, NULL);
     if (!rb)
@@ -1885,6 +1664,7 @@ int main(int argc, char **argv)
         err = ring_buffer__poll(events, 100 /* timeout, ms */);
         err = ring_buffer__poll(port_rb, 100 /* timeout, ms */);
         err = ring_buffer__poll(redis_stat_rb, 100 /* timeout, ms */);
+        err = ring_buffer__poll(rate_rb, 100 /* timeout, ms */);
         print_conns(skel);
         sleep(1);
         /* Ctrl-C will cause -EINTR */
@@ -1898,8 +1678,22 @@ int main(int argc, char **argv)
             printf("Error polling perf buffer: %d\n", err);
             break;
         }
-
         gettimeofday(&end, NULL);
+        if (overrun_time)
+        {
+            u32 key = 0;
+            struct tcp_args_s new_args;
+            new_args.sample_period = overrun_time;
+
+            // 更新 args_map，传递采样周期给 BPF 程序
+            err = bpf_map_update_elem(bpf_map__fd(skel->maps.args_map), &key, &new_args, BPF_ANY);
+            if (err)
+            {
+                fprintf(stderr, "Failed to update sample period\n");
+                return 1;
+            }
+        }
+
         if ((end.tv_sec - start.tv_sec) >= 5)
         {
             if (rst_info)
@@ -1941,6 +1735,7 @@ cleanup:
     ring_buffer__free(events);
     ring_buffer__free(port_rb);
     ring_buffer__free(redis_stat_rb);
+    ring_buffer__free(rate_rb);
     net_watcher_bpf__destroy(skel);
     return err < 0 ? -err : 0;
 }

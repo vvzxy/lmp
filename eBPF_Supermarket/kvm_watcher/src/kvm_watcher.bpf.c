@@ -32,7 +32,7 @@
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 const volatile pid_t vm_pid = -1;
-const volatile char hostname[64] = "";
+const volatile char hostname[13] = "";
 static struct common_event *e;
 
 // 定义环形缓冲区maps
@@ -245,25 +245,20 @@ int BPF_KPROBE(kp_start_sw_timer, struct kvm_lapic *apic) {
     CHECK_PID(vm_pid);
     return trace_start_sw_timer(apic);
 }
-
 //采集容器的系统用调用信息
 SEC("tracepoint/raw_syscalls/sys_enter")
 int tp_container_sys_entry(struct trace_event_raw_sys_enter *args) {
-    //过滤进程
-    bool is_container = is_container_task(hostname);
-    if (is_container) {
+     if(is_container_task(hostname)){
         return trace_container_sys_entry(args);
-    } else {
+    }else{
         return 0;
     }
 }
 SEC("tracepoint/raw_syscalls/sys_exit")
 int tracepoint__syscalls__sys_exit(struct trace_event_raw_sys_exit *args) {
-    //过滤进程
-    bool is_container = is_container_task(hostname);
-    if (is_container) {
-        return trace_container_sys_exit(args, &rb, e);
-    } else {
+    if(is_container_task(hostname)){
+        return trace_container_sys_exit(args);
+    }else{
         return 0;
     }
 }

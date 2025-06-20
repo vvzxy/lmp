@@ -1,30 +1,37 @@
 #ifndef __FS_WATCHER_H
 #define __FS_WATCHER_H
 
-/*open*/
 #define path_size 256
 #define TASK_COMM_LEN 16
 
+/*open*/
 struct event_open {
-	int pid_;
-	char path_name_[path_size];
-	int n_;
-    char comm[TASK_COMM_LEN];
+    pid_t pid;          // 进程 ID
+    int dfd;            // 目录文件描述符
+    char filename[256]; // 文件路径
+    int flags;          // 打开标志
+    int fd;             // 文件描述符
+    int ret;            // 系统调用返回值
 };
 
 /*read*/
-
 struct event_read {
-	int pid;
-    unsigned long long duration_ns;
+    int pid;
+    char filename[256]; // 文件名
+    int count_size;     // 读取的字节数
+    unsigned short file_type; // 文件类型
 };
 
 /*write*/
 struct fs_t {
-    unsigned long inode_number;
-    pid_t pid;
-    size_t real_count;
-    size_t count;
+    unsigned long inode_number;  // inode号
+    pid_t pid;                   // 进程ID
+    size_t real_count;           // 实际写入字节数
+    size_t count;                // 请求写入的字节数
+    unsigned int flags;          // 文件访问模式
+    mode_t mode;                 // 文件权限
+    char comm[TASK_COMM_LEN];    // 进程名称
+    char filename[path_size];     // 文件名
 };
 
 /*disk_io_visit*/
@@ -50,12 +57,15 @@ struct event_block_rq_issue {
 
 /*CacheTrack*/
 struct event_CacheTrack{
-    pid_t pid;
+    char comm[16];
     long long time; //耗时
-    // char name[32];          // 设备名称
     ino_t ino;             // inode 号
     unsigned long state;    // inode 状态
     unsigned long flags;    // inode 标志
+    long int nr_to_write;  // 待写回字节数
+    long unsigned int writeback_index; //写回操作的索引或序号
+    long unsigned int wrote; //已写回的字节数
+    long long time_complete;  // 写回开始时间
 };
 
-#endif /* __MEM_WATCHER_H */
+#endif /* __FS_WATCHER_H */

@@ -10,15 +10,16 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 102400);
 	__type(key, u64);
-	__type(value, struct zone_info);
-} zones SEC(".maps");
+	__type(value, struct pgdat_info);
+} nodes SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 102400);
 	__type(key, u64);
-	__type(value, struct pgdat_info);
-} nodes SEC(".maps");
+	__type(value, struct zone_info);
+} zones SEC(".maps");
+
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -27,6 +28,10 @@ struct {
 	__type(value, struct ctg_info);
 } orders SEC(".maps");
 
+static inline bool populated_zone(struct zone *zone)
+{
+	return zone->present_pages;
+}
 static void fill_contig_page_info(struct zone *zone, unsigned int suitable_order,
 				  struct contig_page_info *info)
 {
@@ -47,10 +52,9 @@ static void fill_contig_page_info(struct zone *zone, unsigned int suitable_order
 }
 
 SEC("kprobe/get_page_from_freelist")
-int BPF_KPROBE(get_page_from_freelist, gfp_t gfp_mask, unsigned int order, int alloc_flags,
-	       const struct alloc_context *ac)
+ int BPF_KPROBE(get_page_from_freelist, unsigned int gfp_mask, unsigned int order, int alloc_flags,
+ 	       const struct alloc_context *ac)
 {
-	// bpf_printk("1111");
 	struct pgdat_info node_info = {};
 	struct zone_info zone_data = {};
 
@@ -59,15 +63,23 @@ int BPF_KPROBE(get_page_from_freelist, gfp_t gfp_mask, unsigned int order, int a
 	struct zone *z;
 	int i;
 	unsigned int a_order;
-
+	int count=0;
+	//节点信息
 	pgdat = BPF_CORE_READ(ac, preferred_zoneref, zone, zone_pgdat);
 	node_info.node_id = BPF_CORE_READ(pgdat, node_id);
-	node_info.nr_zones = BPF_CORE_READ(pgdat, nr_zones);
+	for (i = 0; i < __MAX_NR_ZONES; i++) {
+		zref = &pgdat->node_zonelists[0]._zonerefs[i];
+		z = BPF_CORE_READ(zref, zone);
+		u64 present_pages = BPF_CORE_READ(z, present_pages);
+		if (present_pages>0) ++count;
+	}
+	node_info.nr_zones=count;
 	node_info.pgdat_ptr = (u64)pgdat;
 	u64 key = (u64)pgdat;
     
 	bpf_map_update_elem(&nodes, &key, &node_info, BPF_ANY);
 
+	
 	for (i = 0; i < __MAX_NR_ZONES; i++) {
 		zref = &pgdat->node_zonelists[0]._zonerefs[i];
 		z = BPF_CORE_READ(zref, zone);

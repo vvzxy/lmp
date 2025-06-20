@@ -35,7 +35,12 @@
 ## 4. 编译安装
 
 ```bash
-git clone --recurse-submodules <magic_eyes_address>
+# 克隆lmp及其子模块
+git clone --recurse-submodules <lmp_github_address>
+# 或者克隆lmp主项目后，进入MagicEyes目录克隆子模块
+cd MagicEyes
+git submodule update --init --recursive
+# 在MagicEyes目录下执行
 mkdir build && cd build
 # -------------------------------------------------------
 # 若想要编译所有工具

@@ -52,16 +52,17 @@ bool dynamic_filter(struct ewma_info *ewma_syscall_delay, double dataPoint) {
 
 	if(ewma_syscall_delay->previousEWMA == 0) {//初始化ewma算法，则赋值previousEWMA = dataPoint 并打印
 		ewma_syscall_delay->previousEWMA = dataPoint;
-		return 1;
+		return 0;
 	}
-	if(ewma_syscall_delay->count <30){
+	if(ewma_syscall_delay->count <10){
 		ewma_syscall_delay->previousEWMA = calculateEWMA(ewma_syscall_delay->previousEWMA,dataPoint,alpha);//计算
-		return 1;
+		ewma_syscall_delay->count++;
+        return 0;
 	}
 	else{
 		ewma_syscall_delay->previousEWMA = calculateEWMA(ewma_syscall_delay->previousEWMA,dataPoint,alpha);//计算
 		threshold = ewma_syscall_delay->previousEWMA * TOLERANCE;
-		if(dataPoint >= threshold) return 1;
+		if(dataPoint > threshold*5) return 1;
 	}
     return 0;
 }

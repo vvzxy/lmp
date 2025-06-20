@@ -15,6 +15,36 @@ cd ./install/magic_eyes_cli
 # 运行前置条件脚本
 source ./before_running.sh
 ```
+#### 2.1 遇到问题
+这里可能会由于虚拟环境没有建立而产生一个问题：
+```bash
+python 已安装
+bash: ./venv/bin/activate:没有那个文件或目录
+进入venv环境失败
+条件不满足
+```
+这是由于在`before_running.sh`脚本文件中存在以下环境判断而导致的报错：
+```bash
+	# 进入python venv环境
+	if . ./venv/bin/activate; then
+		echo "成功进入venv环境"
+	else
+		echo "进入venv环境失败"
+		return 1
+	fi
+```
+
+我们需要配置相关虚拟环境，即安装venv模块：
+
+```bash
+sudo apt install python3-venv 
+```
+
+安装成功之后，便可通过以下命令在lmp/MagicEyes/build/install/magic_eyes_cli目录下创建虚拟环境：
+```bash
+python3 -m venv venv
+```
+这时再运行`source ./before_running.sh`脚本便可通过。
 
 ### 3. 使用
 
@@ -58,7 +88,7 @@ magic_eyes_cli具有2个固定命令， 即
 ### 4. 例程
 
 ```bash
-magic_eyes_cli process cpu_watcher -h
+./magic_eyes_cli process cpu_watcher -h
 # <------------------ 自动补全 | 非自动补全
 ```
 
